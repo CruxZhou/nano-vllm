@@ -19,10 +19,16 @@ class ModelRunner:
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
-        self.world_size = config.tensor_parallel_size
+        self.world_size = config.tensor_parallel_size #整个并行系统的 GPU 数量
+        #当 TP 系统启动之后，每一张 GPU 上都会启动一个 Model Runner
         self.rank = rank
         self.event = event
-
+        
+        # rank 0 是一个 特殊的 runner ，
+        # 我们通常把它叫做 leader runner，它除了执行任务之外，
+        # 还承担一个额外的职责，那就是 调度和广播任务，
+        # 而其他 runner（rank 1~n-1）则是纯执行者，
+        # 它们只负责执行 leader 分发下来的任务
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
@@ -46,6 +52,10 @@ class ModelRunner:
                 dist.barrier()
                 self.shm = SharedMemory(name="nanovllm")
                 self.loop()
+                #不断循环读取共享内存（loop read shm），
+                # 他们其实是在等待 leader 是否下达新的任务，
+                # 一旦发现共享内存中出现新的 method 和 args，
+                # 它们就会读取命令、调用自己的 call()、执行相同的 method
 
     def exit(self):
         if self.world_size > 1:
@@ -82,9 +92,10 @@ class ModelRunner:
         for event in self.event:
             event.set()
 
-    def call(self, method_name, *args):
-        if self.world_size > 1 and self.rank == 0:
-            self.write_shm(method_name, *args)
+    def call(self, method_name, *args): # 方法名称，seqs，action 例如call("run", seqs, action)
+        if self.world_size > 1 and self.rank == 0: 
+            self.write_shm(method_name, *args) 
+            #把这次调用的 method name、arguments 序列化之后写入 shared memory
         method = getattr(self, method_name, None)
         return method(*args)
 
@@ -154,6 +165,7 @@ class ModelRunner:
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        #  pinned memory（页锁定内存） 是为了让 CPU 到 GPU 的数据传输更高
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -186,19 +198,20 @@ class ModelRunner:
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
 
-    @torch.inference_mode()
+    @torch.inference_mode() #这表示这个函数在推理模式下运行 不记录autograd计算图，不考虑训练
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
+            # decode 小 batch 走 CUDA Graph
             bs = input_ids.size(0)
             context = get_context()
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
             graph_vars = self.graph_vars
-            graph_vars["input_ids"][:bs] = input_ids
+            graph_vars["input_ids"][:bs] = input_ids #前 bs 个位置写入当前真实输入
             graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping
+            graph_vars["slot_mapping"].fill_(-1) #把整个 slot_mapping 全部置成 -1
+            graph_vars["slot_mapping"][:bs] = context.slot_mapping #把前 bs 个有效位置写成当前上下文的真实值
             graph_vars["context_lens"].zero_()
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
@@ -207,6 +220,8 @@ class ModelRunner:
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        #  input_ids，你可以把它理解成模型真正要吃进去的 input token ids ，
+        # 而 positions，就是对应的 位置信息。
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None

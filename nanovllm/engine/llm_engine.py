@@ -41,13 +41,23 @@ class LLMEngine:
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
-            prompt = self.tokenizer.encode(prompt)
+            prompt = self.tokenizer.encode(prompt) #此处使用AutoTokenizer prompt会转换成token id序列
         seq = Sequence(prompt, sampling_params)
-        self.scheduler.add(seq)
+        #一个 sequence 通常包含输入 token、已生成 token、sampling 参数、当前生成状态，
+        # 后面所有推理调度都会以 sequence 为基本单位 进行管理
+        self.scheduler.add(seq) #add单个sequence
 
     def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
+        # 生产者-消费者模型 生产者：LLMEngine.generate() 消费者：step loop
+        # 一次generate()调用可能会传入多个prompt，或多个用户同时调用generate()
+        # scheduler会根据系统情况尽可能多地把多个sequence合并成一个batch交给step执行
+        # scheduler 的 batch 与请求内容的语义完全无关
+        # 不断从Scheduler中取出被调度的sequence 然后执行下一步推理计算
+        seqs, is_prefill = self.scheduler.schedule() #一次性取出一组seqs
+        # is_prefill 表示当前 batch 需要执行的动作类型
+        # 对于一个 sequence 来说，推理流程通常是：1 次 Prefill + N 次 Decode
         token_ids = self.model_runner.call("run", seqs, is_prefill)
+        # 模型预测出的下一个 token 们（因为是很多seqs的）
         self.scheduler.postprocess(seqs, token_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
@@ -58,7 +68,8 @@ class LLMEngine:
 
     def generate(
         self,
-        prompts: list[str] | list[list[int]],
+        prompts: list[str] | list[list[int]], 
+        # 支持直接传入普通文本prompt和tokenized好的token id列表
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[str]:
@@ -87,6 +98,9 @@ class LLMEngine:
                 if use_tqdm:
                     pbar.update(1)
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
+        # 这里有排序：
+        # step loop中一批seqs同时进入model_runner.run()执行推理，不同seq的执行时间不一定相同
+        # 输入顺序不等于输出顺序，通过对seq_id排序保证输出正确
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
         if use_tqdm:
             pbar.close()

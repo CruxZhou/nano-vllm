@@ -9,9 +9,11 @@ class Block:
 
     def __init__(self, block_id):
         self.block_id = block_id
-        self.ref_count = 0
+        self.ref_count = 0 #引用计数
         self.hash = -1
-        self.token_ids = []
+        # 这个 hash 主要用于判断 当前 block 是否已经在缓存中出现过。
+        self.token_ids = [] #block 是固定长度
+        #默认一个block最多存256个token
 
     def update(self, hash: int, token_ids: list[int]):
         self.hash = hash
@@ -67,7 +69,7 @@ class BlockManager:
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
                 cache_miss = True
             if cache_miss:
-                block_id = self.free_block_ids[0]
+                block_id = self.free_block_ids[0] #分配新block
                 block = self._allocate_block(block_id)
             else:
                 seq.num_cached_tokens += self.block_size
@@ -86,9 +88,14 @@ class BlockManager:
             block = self.blocks[block_id]
             block.ref_count -= 1
             if block.ref_count == 0:
-                self._deallocate_block(block_id)
+                self._deallocate_block(block_id) #used_block_ids 移回 free_block_ids
         seq.num_cached_tokens = 0
-        seq.block_table.clear()
+        seq.block_table.clear() 
+        #在很多版本的 vLLM 实现中，当 block 被释放时，
+        # 并不会真的去 清空 GPU 显存中的数据 。
+        # 原因其实很简单：清空显存是一个额外开销 ，而对于 KV Cache 来说，
+        # 其实没有必要这么做，因为下一次新的 sequence 分配到这个 block 时，
+        # 只需要 直接覆盖写入 就可以了
 
     def can_append(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
