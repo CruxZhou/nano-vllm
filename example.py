@@ -8,11 +8,11 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(path)
     llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
 
-    sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
+    sampling_params = SamplingParams(temperature=0.6, max_tokens=256) #采样参数
     prompts = [
         "introduce yourself",
-        "list all prime numbers within 100",
-    ]
+        "list all prime numbers within 100", 
+    ] # 同时处理多个prompt而非逐条推理
     prompts = [
         tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
@@ -21,7 +21,7 @@ def main():
         )
         for prompt in prompts
     ]
-    outputs = llm.generate(prompts, sampling_params)
+    outputs = llm.generate(prompts, sampling_params) # 最外层API入口
 
     for prompt, output in zip(prompts, outputs):
         print("\n")
