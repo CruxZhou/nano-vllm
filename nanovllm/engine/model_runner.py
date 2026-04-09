@@ -7,6 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.models import model_dict
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -30,11 +31,13 @@ class ModelRunner:
         # 而其他 runner（rank 1~n-1）则是纯执行者，
         # 它们只负责执行 leader 分发下来的任务
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        #本地2333端口用nccl通信
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        #self.model = Qwen3ForCausalLM(hf_config)
+        self.model = model_dict[hf_config.model_type](hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
@@ -47,7 +50,7 @@ class ModelRunner:
         if self.world_size > 1:
             if rank == 0:
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
-                dist.barrier()
+                dist.barrier()#同步进程用的
             else:
                 dist.barrier()
                 self.shm = SharedMemory(name="nanovllm")
@@ -56,6 +59,8 @@ class ModelRunner:
                 # 他们其实是在等待 leader 是否下达新的任务，
                 # 一旦发现共享内存中出现新的 method 和 args，
                 # 它们就会读取命令、调用自己的 call()、执行相同的 method
+
+        #注：barrier()控制了开辟共享内存和进程同步的顺序关系
 
     def exit(self):
         if self.world_size > 1:
@@ -80,14 +85,14 @@ class ModelRunner:
         self.event.wait()
         n = int.from_bytes(self.shm.buf[0:4], "little")
         method_name, *args = pickle.loads(self.shm.buf[4:n+4])
-        self.event.clear()
+        self.event.clear() #把 event 状态重置为 False，准备下一次等待
         return method_name, args
 
     def write_shm(self, method_name, *args):
         assert self.world_size > 1 and self.rank == 0
-        data = pickle.dumps([method_name, *args])
+        data = pickle.dumps([method_name, *args]) #pickle是做序列化
         n = len(data)
-        self.shm.buf[0:4] = n.to_bytes(4, "little")
+        self.shm.buf[0:4] = n.to_bytes(4, "little") #整数n转为4字节表示，使用小端序
         self.shm.buf[4:n+4] = data
         for event in self.event:
             event.set()
@@ -100,10 +105,12 @@ class ModelRunner:
         return method(*args)
 
     def warmup_model(self):
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.empty_cache() 
+        torch.cuda.reset_peak_memory_stats() 
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
+        #第一个是对这个batch最大tokens约束，第二个是单个sequence限长的约束
         num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
+        #取最小值是尽可能把这个batch跑满，且保证不超出限制
         seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
         self.run(seqs, True)
         torch.cuda.empty_cache()
@@ -117,6 +124,7 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+        
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
@@ -145,7 +153,7 @@ class ModelRunner:
         block_tables = None
         for seq in seqs:
             seqlen = len(seq)
-            input_ids.extend(seq[seq.num_cached_tokens:])
+            input_ids.extend(seq[seq.num_cached_tokens:])#每个seq从没有被缓存的第一个token开始，直到最后一个token，全部加入到 input_ids 中
             positions.extend(list(range(seq.num_cached_tokens, seqlen)))
             seqlen_q = seqlen - seq.num_cached_tokens
             seqlen_k = seqlen
@@ -161,7 +169,7 @@ class ModelRunner:
                     end = start + self.block_size
                 else:
                     end = start + seq.last_block_num_tokens 
-                slot_mapping.extend(list(range(start, end)))
+                slot_mapping.extend(list(range(start, end))) #把从 start 到 end-1 的所有整数，追加到 slot_mapping 这个列表后面
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -179,8 +187,8 @@ class ModelRunner:
         slot_mapping = []
         context_lens = []
         for seq in seqs:
-            input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
+            input_ids.append(seq.last_token)#每次 decode 的时候，模型只吃当前 seq 的最后一个 token，也就是上一次生成的 token
+            positions.append(len(seq) - 1)#记录token 在自己那条序列里的绝对位置 index
             context_lens.append(len(seq))
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -206,7 +214,7 @@ class ModelRunner:
             # decode 小 batch 走 CUDA Graph
             bs = input_ids.size(0)
             context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]#找到第一个大于等于当前 batch size 的 graph 来执行，保证能覆盖当前 batch 的大小
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids #前 bs 个位置写入当前真实输入
             graph_vars["positions"][:bs] = positions
@@ -225,6 +233,7 @@ class ModelRunner:
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        # 采样：把模型输出的 logits，变成下一个真正要生成的 token id
         reset_context()
         return token_ids
 
@@ -244,7 +253,7 @@ class ModelRunner:
         self.graphs = {}
         self.graph_pool = None
 
-        for bs in reversed(self.graph_bs):
+        for bs in reversed(self.graph_bs): #倒着遍历，因为小 batch 的 graph 往往能复用大 batch 的 graph，倒着建可以让更多的 batch 走 cudagraph
             graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
