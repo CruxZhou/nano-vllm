@@ -3,7 +3,7 @@ import torch
 
 
 @dataclass
-class Context:
+class Context: #设置一些全局变量
     is_prefill: bool = False
     cu_seqlens_q: torch.Tensor | None = None
     cu_seqlens_k: torch.Tensor | None = None

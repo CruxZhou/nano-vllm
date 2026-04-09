@@ -21,7 +21,7 @@ def store_kvcache_kernel(
     idx = tl.program_id(0)
     slot = tl.load(slot_mapping_ptr + idx)
     if slot == -1: return
-    key_offsets = idx * key_stride + tl.arange(0, D)
+    key_offsets = idx * key_stride + tl.arange(0, D) #arange(0, D)是做向量化
     value_offsets = idx * value_stride + tl.arange(0, D)
     key = tl.load(key_ptr + key_offsets)
     value = tl.load(value_ptr + value_offsets)
@@ -31,14 +31,14 @@ def store_kvcache_kernel(
 
 
 def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor):
-    N, num_heads, head_dim = key.shape
+    N, num_heads, head_dim = key.shape #shape：[N, H, D] stride就是：(H * D, D, 1)
     D = num_heads * head_dim
     assert key.stride(-1) == 1 and value.stride(-1) == 1
     assert key.stride(1) == head_dim and value.stride(1) == head_dim
     assert k_cache.stride(1) == D and v_cache.stride(1) == D
-    assert slot_mapping.numel() == N
+    assert slot_mapping.numel() == N #N是总批的tokens数量
     store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
-
+    #相当于启动一维grid，共N个program，每个program放一个kv值
 
 class Attention(nn.Module):
 
@@ -59,15 +59,15 @@ class Attention(nn.Module):
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
-        if k_cache.numel() and v_cache.numel():
-            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+        if k_cache.numel() and v_cache.numel(): #numel：返回一个张量里总共有多少个元素
+            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping) #传入的k和v放入kv cache
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache
             o = flash_attn_varlen_func(q, k, v,
                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                                       softmax_scale=self.scale, causal=True, block_table=context.block_tables)
+                                       softmax_scale=self.scale, causal=True, block_table=context.block_tables)#block_table参数支持paged attention
         else:    # decode
             o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
                                         cache_seqlens=context.context_lens, block_table=context.block_tables, 

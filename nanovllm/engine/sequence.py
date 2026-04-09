@@ -6,7 +6,7 @@ from nanovllm.sampling_params import SamplingParams
 
 
 class SequenceStatus(Enum):
-    WAITING = auto()
+    WAITING = auto() #默认从1开始（如果是cpp，默认从0开始）
     RUNNING = auto()
     FINISHED = auto()
 

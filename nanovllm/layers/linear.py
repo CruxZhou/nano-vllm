@@ -60,8 +60,9 @@ class ColumnParallelLinear(LinearBase):
         bias: bool = False,
     ):
         tp_size = dist.get_world_size()
-        super().__init__(input_size, divide(output_size, tp_size), bias, 0)
-
+        super().__init__(input_size, divide(output_size, tp_size), bias, 0) #0表示的是tp_dim，
+        #torch当中权重实际上是列优先存储的，我们看起来是转置关系，所以这里的0其实是切分列
+        #divide函数：把output_size按照tp_size均分
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
         shard_size = param_data.size(self.tp_dim)
@@ -70,7 +71,7 @@ class ColumnParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight, self.bias)
+        return F.linear(x, self.weight, self.bias) #算完之后没有做归约和GPU通信操作
 
 
 class MergedColumnParallelLinear(ColumnParallelLinear):
@@ -85,8 +86,10 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         super().__init__(input_size, sum(output_sizes), bias)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int):
+        #loaded_shard_id区分0或1，用来判断是gate（0）还是up（1）
         param_data = param.data
         shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
+        # 如果是0就在开头放，如果是1就在第一个shard后面开始放
         shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]

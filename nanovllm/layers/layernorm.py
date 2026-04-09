@@ -37,7 +37,7 @@ class RMSNorm(nn.Module):
         var = x.pow(2).mean(dim=-1, keepdim=True)
         x.mul_(torch.rsqrt(var + self.eps))
         x = x.to(orig_dtype).mul_(self.weight)
-        return x, residual
+        return x, residual #有两个输入的时候就有对应的两个输出
 
     def forward(
         self,
