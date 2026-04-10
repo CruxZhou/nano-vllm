@@ -4,12 +4,12 @@ from transformers import AutoTokenizer
 
 import argparse
 
-def main(model_path:str):
-    path = os.path.expanduser(model_path)
+def main(args):
+    path = os.path.expanduser(args.model_path)
     tokenizer = AutoTokenizer.from_pretrained(path)
-    llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
+    llm = LLM(path, enforce_eager=args.enforce_eager, tensor_parallel_size=args.tensor_parallel_size)
 
-    sampling_params = SamplingParams(temperature=0.6, max_tokens=256) #采样参数
+    sampling_params = SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens) #采样参数
     prompts = [
         "introduce yourself",
         "list all prime numbers within 100", 
@@ -33,6 +33,11 @@ def main(model_path:str):
 if __name__ == "__main__":
     parse = argparse.ArgumentParser(description="nano vllm")
     parse.add_argument("--model_path", type=str, default="~/huggingface/Qwen3-0.6B/", help="Path to the model")
+    parse.add_argument("--tensor-parallel-size", "--tp", type=int, default=1)
+    parse.add_argument("--enforce-eager", type=bool, default=True)
+    parse.add_argument("--temperature", type=float, default=0.6)
+    parse.add_argument("--max-tokens", type=int, default=256)
+    
     args=parse.parse_args()
     
-    main(args.model_path)
+    main(args)
