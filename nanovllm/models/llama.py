@@ -81,6 +81,14 @@ class LlamaAttention(nn.Module):
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        
+        q = q.view(-1, self.num_heads, self.head_dim) #view不改变内存，只是改变了一种看起来的形状而已，-1表示自动计算这个维度的大小 
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
+        if not self.qkv_bias:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+        
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output = self.o_proj(attn_output)
