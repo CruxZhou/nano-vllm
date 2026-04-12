@@ -27,7 +27,8 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
-
+        self.num_new_tokens = 0 
+        
     def __len__(self):
         return self.num_tokens
 
@@ -61,7 +62,16 @@ class Sequence:
     @property
     def last_block_num_tokens(self):
         return self.num_tokens - (self.num_blocks - 1) * self.block_size
-
+    
+    @property
+    def num_context_tokens(self):
+        return self.num_cached_tokens + self.num_new_tokens
+    
+    @property
+    def num_current_blocks(self):
+        assert (self.num_cached_tokens + self.num_new_tokens + self.block_size - 1) // self.block_size == len(self.block_table)
+        return len(self.block_table)
+    
     def block(self, i):
         assert 0 <= i < self.num_blocks
         return self.token_ids[i*self.block_size: (i+1)*self.block_size]

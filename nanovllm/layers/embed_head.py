@@ -59,9 +59,11 @@ class ParallelLMHead(VocabParallelEmbedding):
 
     def forward(self, x: torch.Tensor):
         context = get_context() #拿prefill/decode的状态和切片索引
-        if context.is_prefill:
-            last_indices = context.cu_seqlens_q[1:] - 1
-            x = x[last_indices].contiguous()
+        last_indices = context.cu_seqlens_q[1:] - 1
+        if context.seq_need_compute_logits.numel():
+            last_indices = last_indices[context.seq_need_compute_logits]
+        x = x[last_indices].contiguous()
+       
         logits = F.linear(x, self.weight) #x乘以weight的转置，此处bias为空不用写出来
         if self.tp_size > 1: #如果多卡，那只有一部分的weight（比如本来应该是15w多，四个卡每个卡只有4w多）
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
