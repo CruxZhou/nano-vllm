@@ -4,6 +4,8 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
 
+from time import perf_counter
+
 
 class Scheduler:
 
@@ -69,10 +71,28 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq) #并非放回末尾，而是放回优先位置，因为这个seq已经执行过一部分了，不是一个全新请求
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
+    def postprocess(self, seqs: list[Sequence], token_ids: list[int]):
+        finished = []
+        now = perf_counter()
+        for seq, token_id in zip(seqs, token_ids):
+            if seq.first_token_time is None:
+                seq.first_token_time = now
+                if seq.arrival_time is not None:
+                    seq.ttft = seq.first_token_time - seq.arrival_time
+
+            seq.append_token(token_id)
+
+            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+                seq.status = SequenceStatus.FINISHED
+                self.block_manager.deallocate(seq)
+                self.running.remove(seq)
+                finished.append((seq.seq_id, seq.completion_token_ids, seq.ttft))
+        return finished
+'''    def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
         for seq, token_id in zip(seqs, token_ids):
             seq.append_token(token_id) #追加生成token
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED #标记完成
                 self.block_manager.deallocate(seq) #释放kv cache
                 self.running.remove(seq) #从running队列移除
+                '''

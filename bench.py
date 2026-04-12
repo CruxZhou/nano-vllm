@@ -4,7 +4,33 @@ from random import randint, seed
 from nanovllm import LLM, SamplingParams
 # from vllm import LLM, SamplingParams
 
+def percentile(sorted_list, p):
+    if not sorted_list:
+        return 0.0
+    k = (len(sorted_list) - 1) * p / 100.0
+    f = int(k)
+    c = min(f + 1, len(sorted_list) - 1)
+    if f == c:
+        return sorted_list[f]
+    return sorted_list[f] * (c - k) + sorted_list[c] * (k - f)
 
+
+def print_ttft_stats(ttfts):
+    if not ttfts:
+        print("TTFT: no data")
+        return
+
+    ttfts_ms = sorted(x * 1000.0 for x in ttfts)
+    avg = sum(ttfts_ms) / len(ttfts_ms)
+    print(
+        "TTFT(ms) | "
+        f"avg={avg:.2f}, "
+        f"p50={percentile(ttfts_ms, 50):.2f}, "
+        f"p90={percentile(ttfts_ms, 90):.2f}, "
+        f"p95={percentile(ttfts_ms, 95):.2f}, "
+        f"p99={percentile(ttfts_ms, 99):.2f}"
+    )
+    
 def main():
     seed(0)
     num_seqs = 256
@@ -26,7 +52,7 @@ def main():
     total_tokens = sum(sp.max_tokens for sp in sampling_params)
     throughput = total_tokens / t
     print(f"Total: {total_tokens}tok, Time: {t:.2f}s, Throughput: {throughput:.2f}tok/s")
-
+    print_ttft_stats(llm.last_ttfts)
 
 if __name__ == "__main__":
     main()
