@@ -31,6 +31,7 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self.last_ttfts = []
         atexit.register(self.exit)
 
     def exit(self):
@@ -43,6 +44,7 @@ class LLMEngine:
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt) #此处使用AutoTokenizer prompt会转换成token id序列
         seq = Sequence(prompt, sampling_params)
+        seq.arrival_time = perf_counter()
         #一个 sequence 通常包含输入 token、已生成 token、sampling 参数、当前生成状态，
         # 后面所有推理调度都会以 sequence 为基本单位 进行管理
         self.scheduler.add(seq) #add单个sequence
@@ -58,8 +60,7 @@ class LLMEngine:
         # 对于一个 sequence 来说，推理流程通常是：1 次 Prefill + N 次 Decode
         token_ids,seq_need_compute_logits = self.model_runner.call("run", seqs)
         # 模型预测出的下一个 token 们（因为是很多seqs的）
-        self.scheduler.postprocess(seqs, token_ids,seq_need_compute_logits)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        outputs = self.scheduler.postprocess(seqs, token_ids, seq_need_compute_logits)
         num_total_tokens = sum(len(seq) for seq in seqs if seq.is_finished)
         return outputs, num_total_tokens
 
@@ -79,7 +80,9 @@ class LLMEngine:
             sampling_params = [sampling_params] * len(prompts)
         for prompt, sp in zip(prompts, sampling_params):
             self.add_request(prompt, sp)
+        self.last_ttfts = []
         outputs = {}
+        
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished():
             t = perf_counter()
@@ -93,8 +96,10 @@ class LLMEngine:
                     "Prefill": f"{int(prefill_throughput)}tok/s",
                     "Decode": f"{int(decode_throughput)}tok/s",
                 })
-            for seq_id, token_ids in output:
+            for seq_id, token_ids, ttft in output:
                 outputs[seq_id] = token_ids
+                if ttft is not None:
+                    self.last_ttfts.append(ttft)
                 if use_tqdm:
                     pbar.update(1)
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]

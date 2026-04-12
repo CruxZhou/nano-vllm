@@ -4,6 +4,7 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
 
+from time import perf_counter
 
 class Scheduler:
 
@@ -91,20 +92,34 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int], seq_need_compute_logits) -> list[bool]:
+    def postprocess(self, seqs: list[Sequence], token_ids: list[int], seq_need_compute_logits):
         assert len(token_ids) == len(seq_need_compute_logits)
+        finished = []
+        now = perf_counter()
+
         for seq_index, token_id in zip(seq_need_compute_logits, token_ids):
             seq = seqs[seq_index]
+
+            if seq.first_token_time is None:
+                seq.first_token_time = now
+                if seq.arrival_time is not None:
+                    seq.ttft = seq.first_token_time - seq.arrival_time
+
             seq.append_token(token_id)
+
             if (not seq.ignore_eos and token_id == self.eos) or \
-                seq.num_completion_tokens == seq.max_tokens or \
-                    len(seq) >= self.max_model_len:
+            seq.num_completion_tokens == seq.max_tokens or \
+            len(seq) >= self.max_model_len:
                 if len(seq) >= self.max_model_len:
                     print(f"Sequence {seq.seq_id} reached max_model_len {self.max_model_len}.")
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
+                finished.append((seq.seq_id, seq.completion_token_ids, seq.ttft))
+
         for seq in seqs:
             if seq.status != SequenceStatus.FINISHED:
                 seq.num_cached_tokens = seq.num_cached_tokens + seq.num_new_tokens
                 seq.num_new_tokens = 0
+
+        return finished
