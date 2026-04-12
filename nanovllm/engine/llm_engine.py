@@ -18,20 +18,24 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
+
         for i in range(1, config.tensor_parallel_size):
             event = ctx.Event()
             process = ctx.Process(target=ModelRunner, args=(config, i, event))
             process.start()
             self.ps.append(process)
             self.events.append(event)
+
         self.model_runner = ModelRunner(config, 0, self.events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         self.last_ttfts = []
+
         atexit.register(self.exit)
 
     def exit(self):
@@ -42,71 +46,104 @@ class LLMEngine:
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
-            prompt = self.tokenizer.encode(prompt) #此处使用AutoTokenizer prompt会转换成token id序列
+            prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
         seq.arrival_time = perf_counter()
-        #一个 sequence 通常包含输入 token、已生成 token、sampling 参数、当前生成状态，
-        # 后面所有推理调度都会以 sequence 为基本单位 进行管理
-        self.scheduler.add(seq) #add单个sequence
+        self.scheduler.add(seq)
+        return seq.seq_id
 
-    def step(self):
-        # 生产者-消费者模型 生产者：LLMEngine.generate() 消费者：step loop
-        # 一次generate()调用可能会传入多个prompt，或多个用户同时调用generate()
-        # scheduler会根据系统情况尽可能多地把多个sequence合并成一个batch交给step执行
-        # scheduler 的 batch 与请求内容的语义完全无关
-        # 不断从Scheduler中取出被调度的sequence 然后执行下一步推理计算
-        seqs = self.scheduler.schedule() #一次性取出一组seqs
-        # is_prefill 表示当前 batch 需要执行的动作类型
-        # 对于一个 sequence 来说，推理流程通常是：1 次 Prefill + N 次 Decode
-        token_ids,seq_need_compute_logits = self.model_runner.call("run", seqs)
-        # 模型预测出的下一个 token 们（因为是很多seqs的）
+    def _step_internal(self):
+        """
+        内部版本：
+        返回 scheduler.postprocess 的原始格式，通常是
+        [(seq_id, token_ids, ttft), ...]
+        """
+        seqs = self.scheduler.schedule()
+        token_ids, seq_need_compute_logits = self.model_runner.call("run", seqs)
         outputs = self.scheduler.postprocess(seqs, token_ids, seq_need_compute_logits)
+
+        # 这里保持你原来的统计逻辑，不额外改行为
         num_total_tokens = sum(len(seq) for seq in seqs if seq.is_finished)
         return outputs, num_total_tokens
+
+    def step(self, return_ttft: bool = False):
+        """
+        对外默认兼容 serving_bench.py：
+        - return_ttft=False: 返回 [(seq_id, token_ids), ...]
+        - return_ttft=True:  返回 [(seq_id, token_ids, ttft), ...]
+        """
+        outputs, num_total_tokens = self._step_internal()
+
+        if return_ttft:
+            return outputs, num_total_tokens
+
+        stripped_outputs = []
+        for item in outputs:
+            if isinstance(item, (tuple, list)):
+                if len(item) >= 2:
+                    seq_id = item[0]
+                    token_ids = item[1]
+                    stripped_outputs.append((seq_id, token_ids))
+                else:
+                    raise ValueError(f"Unexpected output format from scheduler.postprocess: {item}")
+            else:
+                raise TypeError(f"Unexpected output type from scheduler.postprocess: {type(item)}")
+
+        return stripped_outputs, num_total_tokens
 
     def is_finished(self):
         return self.scheduler.is_finished()
 
     def generate(
         self,
-        prompts: list[str] | list[list[int]], 
-        # 支持直接传入普通文本prompt和tokenized好的token id列表
+        prompts: list[str] | list[list[int]],
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
-    ) -> list[str]:
+    ) -> list[dict]:
         if use_tqdm:
             pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
+
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
+
         for prompt, sp in zip(prompts, sampling_params):
             self.add_request(prompt, sp)
+
         self.last_ttfts = []
         outputs = {}
-        
-        prefill_throughput = decode_throughput = 0.
+
+        prefill_throughput = 0.0
+        decode_throughput = 0.0
+
         while not self.is_finished():
             t = perf_counter()
-            output, num_tokens = self.step()
+            output, num_tokens = self.step(return_ttft=True)
+
             if use_tqdm:
                 if num_tokens > 0:
-                    prefill_throughput = num_tokens / (perf_counter() - t)
+                    prefill_throughput = num_tokens / max(perf_counter() - t, 1e-8)
                 else:
-                    decode_throughput = -num_tokens / (perf_counter() - t)
+                    decode_throughput = -num_tokens / max(perf_counter() - t, 1e-8)
+
                 pbar.set_postfix({
                     "Prefill": f"{int(prefill_throughput)}tok/s",
                     "Decode": f"{int(decode_throughput)}tok/s",
                 })
+
             for seq_id, token_ids, ttft in output:
                 outputs[seq_id] = token_ids
                 if ttft is not None:
                     self.last_ttfts.append(ttft)
                 if use_tqdm:
                     pbar.update(1)
+
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        # 这里有排序：
-        # step loop中一批seqs同时进入model_runner.run()执行推理，不同seq的执行时间不一定相同
-        # 输入顺序不等于输出顺序，通过对seq_id排序保证输出正确
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        outputs = [
+            {"text": self.tokenizer.decode(token_ids), "token_ids": token_ids}
+            for token_ids in outputs
+        ]
+
         if use_tqdm:
             pbar.close()
+
         return outputs
