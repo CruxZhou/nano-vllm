@@ -18,6 +18,7 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        Sequence.block_size = config.kvcache_block_size
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
@@ -58,7 +59,10 @@ class LLMEngine:
         seqs, is_prefill = self.scheduler.schedule() #一次性取出一组seqs
         # is_prefill 表示当前 batch 需要执行的动作类型
         # 对于一个 sequence 来说，推理流程通常是：1 次 Prefill + N 次 Decode
+        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
+        self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         # 模型预测出的下一个 token 们（因为是很多seqs的）
         
         outputs = self.scheduler.postprocess(seqs, token_ids)
@@ -75,8 +79,7 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[str]:
-        if use_tqdm:
-            pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
+        pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
         for prompt, sp in zip(prompts, sampling_params):
@@ -96,10 +99,8 @@ class LLMEngine:
                     "Prefill": f"{int(prefill_throughput)}tok/s",
                     "Decode": f"{int(decode_throughput)}tok/s",
                 })
-            for seq_id, token_ids, ttft in output:
+            for seq_id, token_ids in output:
                 outputs[seq_id] = token_ids
-                if ttft is not None:
-                    self.last_ttfts.append(ttft)
                 if use_tqdm:
                     pbar.update(1)
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
@@ -107,6 +108,4 @@ class LLMEngine:
         # step loop中一批seqs同时进入model_runner.run()执行推理，不同seq的执行时间不一定相同
         # 输入顺序不等于输出顺序，通过对seq_id排序保证输出正确
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
-        if use_tqdm:
-            pbar.close()
         return outputs

@@ -48,7 +48,7 @@ class BlockManager:
         block.reset()
         self.free_block_ids.remove(block_id)
         self.used_block_ids.add(block_id)
-        return self.blocks[block_id]
+        return block
 
     def _deallocate_block(self, block_id: int) -> Block:
         assert self.blocks[block_id].ref_count == 0
