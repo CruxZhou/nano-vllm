@@ -75,26 +75,32 @@ class Scheduler:
         self.waiting.appendleft(seq) #并非放回末尾，而是放回优先位置，因为这个seq已经执行过一部分了，不是一个全新请求
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
+        finished = []
+
         for seq, token_id in zip(seqs, token_ids):
             if is_prefill:
-                seq.num_cached_tokens = min(seq.num_cached_tokens + seq.num_scheduled_tokens, seq.num_tokens)
-                if seq.num_cached_tokens < seq.num_tokens or seq.num_completion_tokens > 0:    # chunked prefill or re prefill after preemption
+                seq.num_cached_tokens = min(
+                    seq.num_cached_tokens + seq.num_scheduled_tokens,
+                    seq.num_tokens,
+                )
+                if seq.num_cached_tokens < seq.num_tokens or seq.num_completion_tokens > 0:
                     seq.num_scheduled_tokens = 0
                     continue
+
             seq.append_token(token_id)
+
+            if seq.num_completion_tokens == 1 and seq.arrival_time is not None and seq.ttft is None:
+                seq.first_token_time = perf_counter()
+                seq.ttft = seq.first_token_time - seq.arrival_time
+
             seq.num_cached_tokens += 1
             seq.num_scheduled_tokens = 0
+
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
                 finished.append((seq.seq_id, seq.completion_token_ids, seq.ttft))
+
         return finished
-'''    def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
-        for seq, token_id in zip(seqs, token_ids):
-            seq.append_token(token_id) #追加生成token
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
-                seq.status = SequenceStatus.FINISHED #标记完成
-                self.block_manager.deallocate(seq) #释放kv cache
-                self.running.remove(seq) #从running队列移除
-                '''
+

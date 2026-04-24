@@ -51,23 +51,15 @@ class LLMEngine:
         self.scheduler.add(seq) #add单个sequence
 
     def step(self):
-        # 生产者-消费者模型 生产者：LLMEngine.generate() 消费者：step loop
-        # 一次generate()调用可能会传入多个prompt，或多个用户同时调用generate()
-        # scheduler会根据系统情况尽可能多地把多个sequence合并成一个batch交给step执行
-        # scheduler 的 batch 与请求内容的语义完全无关
-        # 不断从Scheduler中取出被调度的sequence 然后执行下一步推理计算
-        seqs, is_prefill = self.scheduler.schedule() #一次性取出一组seqs
-        # is_prefill 表示当前 batch 需要执行的动作类型
-        # 对于一个 sequence 来说，推理流程通常是：1 次 Prefill + N 次 Decode
+        seqs, is_prefill = self.scheduler.schedule()
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+
         token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        # 模型预测出的下一个 token 们（因为是很多seqs的）
-        
-        outputs = self.scheduler.postprocess(seqs, token_ids)
-        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
+
+        outputs = self.scheduler.postprocess(seqs, token_ids, is_prefill)
+
         return outputs, num_tokens
+
 
     def is_finished(self):
         return self.scheduler.is_finished()
@@ -99,8 +91,10 @@ class LLMEngine:
                     "Prefill": f"{int(prefill_throughput)}tok/s",
                     "Decode": f"{int(decode_throughput)}tok/s",
                 })
-            for seq_id, token_ids in output:
+            for seq_id, token_ids, ttft in output:
                 outputs[seq_id] = token_ids
+                if ttft is not None:
+                    self.last_ttfts.append(ttft)
                 if use_tqdm:
                     pbar.update(1)
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
