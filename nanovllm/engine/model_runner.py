@@ -152,11 +152,10 @@ class ModelRunner:
         slot_mapping = []
         block_tables = None
         for seq in seqs:
-            seqlen = len(seq)
-            start = min(seq.num_cached_tokens, seqlen - 1)
+            start = seq.num_cached_tokens
             seqlen_q = seq.num_scheduled_tokens
-            seqlen_k = seqlen
             end = start + seqlen_q
+            seqlen_k = end
             input_ids.extend(seq[start:end])
             positions.extend(range(start, end))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)

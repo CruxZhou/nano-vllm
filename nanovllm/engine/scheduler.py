@@ -13,6 +13,7 @@ class Scheduler:
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
+        self.block_size = config.kvcache_block_size
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
@@ -30,21 +31,28 @@ class Scheduler:
         # prefill
         while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.waiting[0]
-            num_tokens = max(seq.num_tokens - seq.num_cached_tokens, 1)
             remaining = self.max_num_batched_tokens - num_batched_tokens
-            if remaining == 0 or (not seq.block_table and not self.block_manager.can_allocate(seq)):    # no budget
-                break
-            if remaining < num_tokens and scheduled_seqs:    # only allow chunked prefill for the first seq
+            if remaining == 0:
                 break
             if not seq.block_table:
-                self.block_manager.allocate(seq)
+                num_cached_blocks = self.block_manager.can_allocate(seq)
+                if num_cached_blocks == -1:
+                    break
+                num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
+            else:
+                num_tokens = seq.num_tokens - seq.num_cached_tokens
+            if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
+                break
+            if not seq.block_table:
+                self.block_manager.allocate(seq, num_cached_blocks)
             seq.num_scheduled_tokens = min(num_tokens, remaining)
-            if seq.num_scheduled_tokens == num_tokens:
+            num_batched_tokens += seq.num_scheduled_tokens
+            if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
                 seq.status = SequenceStatus.RUNNING
                 self.waiting.popleft()
                 self.running.append(seq)
             scheduled_seqs.append(seq)
-            num_batched_tokens += seq.num_scheduled_tokens
+
         if scheduled_seqs:
             return scheduled_seqs, True
 
@@ -63,6 +71,7 @@ class Scheduler:
                     break
             else:
                 seq.num_scheduled_tokens = 1
+                seq.is_prefill = False
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
         assert scheduled_seqs
@@ -71,6 +80,7 @@ class Scheduler:
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
+        seq.is_prefill = True
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq) #并非放回末尾，而是放回优先位置，因为这个seq已经执行过一部分了，不是一个全新请求
 
@@ -78,23 +88,18 @@ class Scheduler:
         finished = []
 
         for seq, token_id in zip(seqs, token_ids):
-            if is_prefill:
-                seq.num_cached_tokens = min(
-                    seq.num_cached_tokens + seq.num_scheduled_tokens,
-                    seq.num_tokens,
-                )
-                if seq.num_cached_tokens < seq.num_tokens or seq.num_completion_tokens > 0:
-                    seq.num_scheduled_tokens = 0
-                    continue
-
+            self.block_manager.hash_blocks(seq)
+            seq.num_cached_tokens += seq.num_scheduled_tokens
+            seq.num_scheduled_tokens = 0
+            if is_prefill and seq.num_cached_tokens < seq.num_tokens:
+                continue
             seq.append_token(token_id)
 
             if seq.num_completion_tokens == 1 and seq.arrival_time is not None and seq.ttft is None:
                 seq.first_token_time = perf_counter()
                 seq.ttft = seq.first_token_time - seq.arrival_time
 
-            seq.num_cached_tokens += 1
-            seq.num_scheduled_tokens = 0
+            
 
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
