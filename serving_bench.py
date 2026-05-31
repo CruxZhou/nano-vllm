@@ -8,6 +8,7 @@ from nanovllm import LLM, SamplingParams
 
 
 # python /data/slwang/nano-vllm-online-running-first-schedule/serving_bench.py --model /data/hfhub/Qwen3/Qwen3-14B/ --request-rate 10 --num-requests 1024 --tensor-parallel-size 1 --max-num-batched-tokens 1024 --max-num-seqs 1024 --random-input-len 128 --random-output-len 100 --chunked-prefill --enforce-eager
+PERCENTILES = (50, 90, 99)
 
 # --- Seed for reproducibility ---
 seed(100)
@@ -47,6 +48,22 @@ class RequestMetrics:
     @property
     def latency(self):
         return self.completion_time - self.submission_time
+
+
+def valid_values(values):
+    return [float(v) for v in values if not np.isnan(v)]
+
+
+def format_distribution(name, values, unit, scale=1.0):
+    values = [v * scale for v in valid_values(values)]
+    if not values:
+        return f"{name}({unit}): no data"
+
+    percentiles = np.percentile(values, PERCENTILES)
+    percentile_text = ", ".join(
+        f"p{p}={value:.2f}" for p, value in zip(PERCENTILES, percentiles)
+    )
+    return f"{name}({unit}) | avg={np.mean(values):.2f}, {percentile_text}"
     
 
 def warm_up(engine, args):
@@ -54,7 +71,7 @@ def warm_up(engine, args):
     # prompts = [[randint(0, 10000) for _ in range(randint(100, MAX_INPUT_LEN))] for _ in range(NUM_REQUESTS)]
     prompts = [[randint(0, 10000) for _ in range(args.random_input_len)] for _ in range(50)]
     # sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=randint(100, MAX_OUTPUT_LEN)) for _ in range(NUM_REQUESTS)]
-    sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=args.random_output_len) for _ in range(args.num_requests)]
+    sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=args.random_output_len) for _ in range(len(prompts))]
     outputs = engine.generate(prompts, sampling_params)
     
 
@@ -149,21 +166,30 @@ def main():
     total_time = end_time - start_time
 
     # --- Calculate and print metrics ---
+    completed_metrics = [m for m in metrics.values() if m.completion_time != -1]
+    ttfts = [m.ttft for m in metrics.values() if m.first_token_time != -1]
+    tpots = [m.tpot for m in completed_metrics]
+    latencies = [m.latency for m in completed_metrics]
+
     total_input_tokens = sum(m.input_len for m in metrics.values())
-    total_output_tokens = sum(m.output_len for m in metrics.values() if m.output_len != -1)
-    
-    avg_ttft = np.mean([m.ttft for m in metrics.values() if m.first_token_time != -1])
-    avg_tpot = np.mean([m.tpot for m in metrics.values() if not np.isnan(m.tpot)])
-    avg_latency = np.mean([m.latency for m in metrics.values() if m.completion_time != -1])
-    throughput = (total_input_tokens + total_output_tokens) / total_time
+    total_output_tokens = sum(m.output_len for m in completed_metrics)
+
+    request_throughput = len(completed_metrics) / total_time
+    input_throughput = total_input_tokens / total_time
+    output_throughput = total_output_tokens / total_time
+    total_token_throughput = (total_input_tokens + total_output_tokens) / total_time
 
     print("--- Benchmark Results ---")
     print(f"Total time: {total_time:.2f}s")
     print(f"Requests sent: {requests_sent}")
-    print(f"Throughput: {throughput:.2f} tokens/s")
-    print(f"Average TTFT: {avg_ttft * 1000:.2f} ms")
-    print(f"Average TPOT: {avg_tpot * 1000:.2f} ms")
-    print(f"Average latency: {avg_latency:.2f} s")
+    print(f"Requests completed: {len(completed_metrics)}")
+    print(f"Request throughput: {request_throughput:.2f} req/s")
+    print(f"Input throughput: {input_throughput:.2f} tokens/s")
+    print(f"Output throughput: {output_throughput:.2f} tokens/s")
+    print(f"Total token throughput: {total_token_throughput:.2f} tokens/s")
+    print(format_distribution("TTFT", ttfts, "ms", scale=1000.0))
+    print(format_distribution("TPOT", tpots, "ms", scale=1000.0))
+    print(format_distribution("Latency", latencies, "s"))
     print("-------------------------\n")
 
 if __name__ == "__main__":
