@@ -12,6 +12,7 @@ def main(args):
     sampling_params = SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens) #采样参数
     prompts = [
         "introduce yourself",
+        "Summaryze:I Have a Dream.I am happy to join with you today in what will go down in history as the greatest demonstration for freedom in the history of our nation.Five score years ago, a great American, in whose symbolic shadow we stand today, signed the Emancipation Proclamation.This momentous decree came as a great beacon light of hope to millions of Negro slaves who hadbeen seared in the flames of withering injustice.It came as a joyous daybreak to end the long night of bad captivity.But one hundred years later, the Negro still is not free.One hundred years later, the life of the Negro is still sadly crippled by the manacles of segregation and the chains of discrimination."
         "list all prime numbers within 100", 
     ] # 同时处理多个prompt而非逐条推理
     prompts = [
